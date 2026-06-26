@@ -1,80 +1,224 @@
-# Carpark Availability — Data Engineering Pipeline
+# Singapore Carpark Availability — Data Engineering Pipeline
 
-Real-time + batch pipeline that ingests Singapore carpark availability (LTA DataMall)
-and weather (Open-Meteo), predicts availability for the next 2 hours, evaluates the
-model daily, and serves a live dashboard with anomaly alerts.
+A real-time + batch data engineering pipeline that ingests live carpark
+availability for ~2,600 carparks across Singapore, predicts availability two
+hours ahead, evaluates the model daily against what actually happened, and serves
+everything through a live dashboard with a map, forecasts, and anomaly alerts.
+
+It is a **data engineering** project first: the machine-learning model is one
+component that the pipeline feeds and serves, not the centrepiece.
+
+---
+
+## What it does
+
+- **Ingests** live carpark availability from LTA DataMall and current weather from
+  Open-Meteo, every 60 seconds.
+- **Streams** that data through Kafka into Spark Structured Streaming, which cleans,
+  validates and deduplicates it.
+- **Stores** it two ways: a partitioned **Parquet** data lake (analytical history)
+  and **Postgres** (fast serving state for the dashboard).
+- **Builds features and trains** a model on a schedule via Airflow, tracking and
+  registering it in MLflow.
+- **Predicts** availability for the next two hours per carpark, and **evaluates**
+  yesterday's predictions against the actuals each morning at 08:00.
+- **Serves** a Streamlit dashboard: live map, current weather, per-carpark forecast,
+  prediction-accuracy chart, and anomaly alerts.
+
+---
 
 ## Architecture
 
 ```
-LTA API + Open-Meteo
-   -> Producer (poll 60s, retries, dedup)
-   -> Kafka (carpark_raw, weather_raw)
-   -> Spark Structured Streaming (clean, validate, dedup)
-        -> Parquet lake (partitioned by date)      [analytical store]
-        -> Postgres latest_state                   [serving store]
-Airflow:
-   -> hourly_features        (build feature table from the lake)
-   -> daily_retrain_eval     (08:00: evaluate yesterday, then retrain)
-MLflow: track -> evaluate -> register
-FastAPI: loads registered model, serves /predict
-Streamlit dashboard: live map, predictions, predicted-vs-actual, alerts
+                        REAL-TIME (streaming)
+ LTA + Open-Meteo API
+        -> Producer (poll 60s, retries, dedup)
+        -> Kafka (topics: carpark_raw, weather_raw)
+        -> Spark Structured Streaming (clean, validate, dedup)
+             -> Parquet lake   (/data/lake, partitioned by date)   [analytical]
+             -> Postgres        (latest_state, readings, weather)    [serving]
+
+                        SCHEDULED (batch / MLOps, via Airflow)
+   hourly_features      -> build lag/time + weather features  -> features table
+   daily_retrain_eval   -> evaluate yesterday vs actuals
+                        -> train + register model (MLflow)
+                        -> generate next-2h predictions        -> predictions table
+
+                        SERVING
+   FastAPI   -> loads the registered model, serves /predict
+   Streamlit -> live map, weather, forecast, accuracy, alerts
 ```
+
+All services run together under one `docker-compose.yml`.
+
+---
+
+## Tech stack
+
+| Layer | Tool | Why |
+|-------|------|-----|
+| Ingestion | Python producer + **Kafka** | Decouples the API poller from processing; buffers across restarts |
+| Stream processing | **Spark** Structured Streaming | Distributed, checkpointed cleaning/validation/dedup |
+| Analytical store | **Parquet** lake | Columnar, compressed, partitioned — ideal for training scans |
+| Serving store | **Postgres** | Fast single-row lookups for the dashboard |
+| Orchestration | **Airflow** | Scheduled batch: hourly features + daily 08:00 retrain/evaluate |
+| ML lifecycle | **MLflow** | Experiment tracking + model registry |
+| Inference | **FastAPI** | Loads the registered model, serves predictions |
+| Dashboard | **Streamlit** + PyDeck | Live map, forecast, accuracy, alerts |
+| Packaging | **Docker Compose** | One-command reproducible stack |
+
+---
+
+## Project layout
+
+```
+carpark-pipeline/
+├── docker-compose.yml      # all services
+├── schema.sql              # Postgres tables (auto-run on first start)
+├── .env.example            # copy to .env and add your LTA key
+├── common/
+│   ├── config.py           # central config from env vars
+│   ├── logging_setup.py     # shared structured logging
+│   ├── sources.py          # pluggable data source (LTA; GBFS bike-share stub)
+│   └── weather.py          # Open-Meteo forecast + historical helpers
+├── producer/producer.py    # polls APIs, publishes to Kafka (retries, dedup)
+├── streaming/stream_job.py # Spark: Kafka -> clean -> Parquet + Postgres (2 streams)
+├── airflow/dags/
+│   ├── hourly_features_dag.py    # @hourly feature build
+│   └── daily_retrain_dag.py      # 08:00 evaluate -> train -> predict
+├── ml/model.py             # feature build, train/register, evaluate
+├── api/main.py             # FastAPI inference service
+├── dashboard/app.py        # Streamlit dashboard
+├── demo_seed.sql           # seed synthetic predictions for the accuracy demo
+└── demo_eval.py            # run an evaluation immediately (demo)
+```
+
+---
+
+## Prerequisites
+
+- Docker Desktop (with Compose).
+- A free **LTA DataMall AccountKey** — register at https://datamall.lta.gov.sg/.
+  (Open-Meteo weather needs no key.)
+
+---
 
 ## Quick start
 
-1. Register at https://datamall.lta.gov.sg/ for a free AccountKey.
-2. `cp .env.example .env` and paste your key into `LTA_ACCOUNT_KEY`.
-3. `docker compose up --build`
-4. Open: dashboard http://localhost:8501 · Airflow http://localhost:8080 · MLflow http://localhost:5000
+1. Copy the environment template and add your key:
+   ```
+   cp .env.example .env            # Windows PowerShell: Copy-Item .env.example .env
+   ```
+   Open `.env` and paste your key into `LTA_ACCOUNT_KEY=`.
 
-## What runs out of the box vs what you build
+2. Build and start everything:
+   ```
+   docker compose up -d --build
+   ```
+   First run takes a few minutes (Spark downloads connector JARs; Airflow initialises).
 
-This is a skeleton, not a finished system. After `docker compose up`:
+3. Open the UIs (confirm ports with `docker compose ps`):
+   - Dashboard — http://localhost:8501
+   - Airflow   — http://localhost:8080  (login `admin` / `admin`)
+   - MLflow    — http://localhost:5000
+   - API docs  — http://localhost:8000/docs
 
-Works immediately: all services start, Postgres auto-creates its tables from
-`schema.sql`, the producer pulls real LTA + weather data and publishes to Kafka,
-the Spark job consumes and writes Parquet + the staging table.
+4. Verify data is flowing:
+   ```
+   docker compose exec postgres psql -U carpark -d carpark -c "SELECT count(*) FROM latest_state;"
+   ```
+   A non-zero count means the real-time path is working.
 
-You fill these in (marked `TODO` in the code), following the build order below:
-- Spark: the MERGE from `latest_state_staging` into `latest_state` (SQL is in `schema.sql`).
-- Airflow `hourly_features`: read Parquet, join weather, write the feature table.
-- Airflow `daily_retrain_eval`: load features -> `ml.model.train_and_register`;
-  load yesterday's predictions + actuals -> `ml.model.evaluate_yesterday`.
-- Historical weather backfill (Open-Meteo archive endpoint) for the eval loop.
-- Writing predictions into the `predictions` table so the comparison chart has data.
+---
 
-The dashboard's live map works once `latest_state` is populated (i.e. after you
-wire the MERGE). Until then it'll show an empty map — that's expected, not a bug.
+## Producing predictions
 
-## Suggested build order (de-risk first, polish last)
+The model is created by Airflow, so trigger the DAGs once to bootstrap it:
 
-- Week 1 — one record end to end: producer -> Kafka -> Spark -> one Parquet file -> dashboard reads it. (Secures the 30 pipeline marks.)
-- Week 2 — batch + ML loop: hourly feature DAG, MLflow training, the daily 08:00 evaluate+retrain. (Secures the 30 ML/real-time marks.)
-- Week 3 — robustness + polish: retries, data-quality checks, dedup, logging, anomaly alert, tidy compose. Then slides + rehearse. (The 10 robustness marks + 30 presentation marks.)
+1. In Airflow, enable and run **`hourly_features`** a few times to build up the
+   `features` table.
+2. Then run **`daily_retrain_eval`**. Its tasks run in order:
+   `evaluate_yesterday` → `train_and_register` → `generate_predictions`.
+3. Confirm a model registered in MLflow (Models tab), then reload the inference API:
+   ```
+   docker compose restart api
+   ```
+4. Refresh the dashboard — the per-carpark forecast now works.
 
-## How each file maps to the rubric
+> The daily `evaluate_yesterday` step only has data to compare once predictions have
+> been sitting for a day. To see the accuracy chart immediately, use the demo below.
 
-| Rubric criterion | Where it lives |
-|---|---|
-| End-to-end pipeline | producer -> kafka -> streaming/stream_job.py -> Parquet + Postgres -> dashboard |
-| Batch processing | airflow/dags/hourly_features_dag.py |
-| Model train/inference | ml/model.py, api/main.py |
-| Real-time | producer + Kafka + Spark streaming + dashboard refresh |
-| Daily 8am evaluation | airflow/dags/daily_retrain_dag.py (schedule `0 8 * * *`) |
-| Predicted vs actual | ml.model.evaluate_yesterday + dashboard accuracy section |
-| Anomaly alerts | dashboard/app.py detect_anomalies() |
-| Robustness | producer retries/dedup, Spark data-quality filters, logging, Airflow retries |
-| Presentation highlights | docker-compose.yml (services), the two DAGs (retries/deps), Kafka flow |
+### Demo: see the accuracy chart now
 
-## Switching to bike-share later
+```
+# seed synthetic predictions matching readings you've already collected
+Get-Content demo_seed.sql | docker compose exec -T postgres psql -U carpark -d carpark   # PowerShell
+# (bash:  docker compose exec -T postgres psql -U carpark -d carpark < demo_seed.sql)
 
-Everything downstream reads a normalised record shape. To switch sources, add a
-`GBFSBikeShareSource` URL in `common/sources.py` and change one line in
-`producer/producer.py`. Nothing else changes.
+# run an evaluation over all predictions vs actuals
+docker compose exec airflow python /opt/airflow/demo_eval.py
+```
+Refresh the dashboard — the predicted-vs-actual scatter and MAE appear.
+**Note:** these numbers are synthetic; they demonstrate the loop, not real accuracy.
 
-## Reflection (prepare for the video)
+---
 
-1. Most challenging part?
-2. What are you most proud of?
-3. What would you add with more time?
+## Dashboard features
+
+- **Live map** — every carpark plotted; colour scales red→green by availability
+  relative to peers; hover a point for its name and current free lots.
+- **Current weather** — streamed temperature, rain, and wind.
+- **2-hour forecast** — pick any carpark; predicts for the real target time using
+  current weather.
+- **Prediction accuracy** — predicted-vs-actual scatter and mean absolute error.
+- **Anomaly alerts** — a rolling z-score flags carparks unusually full or empty.
+
+---
+
+## Robustness features
+
+- Producer **retries** with exponential backoff on API failures.
+- **Deduplication** at the source and in-stream (Spark watermark).
+- **Data-quality checks** drop null IDs, impossible coordinates, negative values.
+- **Idempotent upserts** (staging + MERGE / `ON CONFLICT`) — safe to re-run.
+- **Airflow retries** so transient task failures self-recover.
+- **Model monitoring** — daily MAE logged to MLflow as a drift signal.
+- **Structured logging** across every service.
+
+---
+
+## Daily operations
+
+Stop everything (keeps your data):
+```
+docker compose down
+```
+
+Start it again later (fast — images and JARs are cached):
+```
+docker compose up -d
+```
+If the streaming job lost the startup race with Kafka: `docker compose restart spark`.
+If the dashboard says predictions aren't reachable: `docker compose restart api`.
+
+> Do **not** use `docker compose down -v` unless you intend to wipe all stored data
+> (readings, weather, the trained model). Plain `down` preserves the volumes.
+
+---
+
+## Switching the data source (e.g. to bike-share)
+
+Everything downstream consumes a normalised record shape, so the source is pluggable.
+To switch, add a source class in `common/sources.py` (a `GBFSBikeShareSource` stub is
+included) and change one line in `producer/producer.py`. Nothing else changes.
+
+---
+
+## Notes & limitations
+
+- LTA does not report each carpark's total capacity, so the map colours availability
+  *relative to other carparks*, not as a true "percent full".
+- The model is intentionally simple; the engineering value is in the surrounding
+  pipeline and MLOps loop, not model sophistication.
+- Weather accumulates more slowly than carpark data — Open-Meteo's current reading
+  changes roughly every 15 minutes and unchanged values are deduplicated.
