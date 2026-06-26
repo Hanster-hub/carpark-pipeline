@@ -1,0 +1,12 @@
+requests
+kafka-python
+pyspark==3.5.1
+mlflow==2.13.0
+scikit-learn
+pandas
+fastapi
+uvicorn[standard]
+streamlit
+sqlalchemy
+psycopg2-binary
+apache-airflow==2.9.0

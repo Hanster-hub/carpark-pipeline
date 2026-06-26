@@ -1,0 +1,95 @@
+# One compose file starts the whole pipeline. This file itself is a presentation
+# highlight: "here are the services that start together and how they're configured."
+#
+#   docker compose up --build
+#
+# Services:
+#   zookeeper + kafka   -> message queue (real-time ingestion backbone)
+#   producer            -> polls LTA carpark API + Open-Meteo, publishes to Kafka
+#   spark               -> structured streaming: clean/validate -> Parquet + Postgres
+#   postgres            -> serving DB (latest state + predictions for the dashboard)
+#   mlflow              -> experiment tracking + model registry
+#   airflow             -> orchestrates hourly features + daily 8am retrain/evaluate
+#   api                 -> FastAPI inference service (loads registered model)
+#   dashboard           -> Streamlit live map / predictions / alerts
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  postgres:
+    image: postgres:16
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_DB: ${PG_DB:-carpark}
+      POSTGRES_USER: ${PG_USER:-carpark}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-carpark}
+    volumes:
+      - ./data/pg:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri /mlflow --serve-artifacts --artifacts-destination /mlflow/artifacts
+    ports: ["5000:5000"]
+    volumes:
+      - ./data/mlflow:/mlflow
+
+  producer:
+    build: { context: ., dockerfile: producer/Dockerfile }
+    depends_on: [kafka]
+    env_file: [.env]
+
+  spark:
+    build: { context: ., dockerfile: streaming/Dockerfile }
+    depends_on: [kafka, postgres]
+    env_file: [.env]
+    volumes:
+      - ./data:/data
+
+  airflow:
+    build: { context: ., dockerfile: airflow/Dockerfile }
+    depends_on: [postgres, mlflow]
+    ports: ["8080:8080"]
+    env_file: [.env]
+    environment:
+      # Airflow keeps its own metadata in the same Postgres, separate 'airflow' db.
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${PG_USER:-carpark}:${PG_PASSWORD:-carpark}@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      PYTHONPATH: /opt/airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/data
+    # init the metadata db + create the admin user, then run standalone (web+scheduler)
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --username admin --password admin
+               --firstname a --lastname b --role Admin --email a@b.c || true &&
+               airflow standalone"
+
+  api:
+    build: { context: ., dockerfile: api/Dockerfile }
+    depends_on: [mlflow]
+    ports: ["8000:8000"]
+    env_file: [.env]
+
+  dashboard:
+    build: { context: ., dockerfile: dashboard/Dockerfile }
+    depends_on: [postgres, api]
+    ports: ["8501:8501"]
+    env_file: [.env]
